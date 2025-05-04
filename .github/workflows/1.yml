@@ -159,7 +159,8 @@ jobs:
         working-directory: kernel_workspace/kernel_platform
         run: |
           # 添加详细日志参数
-          tools/bazel run --config=fast --config=stamp --lto=thin --verbose_failures --sandbox_debug //common:kernel_aarch64_dist -- --dist_dir=dist
+          #tools/bazel run --config=fast --config=stamp --lto=thin --verbose_failures --sandbox_debug //common:kernel_aarch64_dist -- --dist_dir=dist
+          tools/bazel run --config=fast --config=stamp --lto=thin //common:kernel_aarch64_dist -- --dist_dir=dist
 
       - name: Patch Kernel Image
         working-directory: kernel_workspace/kernel_platform/dist
