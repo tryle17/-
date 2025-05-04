@@ -1,0 +1,157 @@
+name: test
+on:
+  workflow_dispatch:
+    inputs:
+      CPU:
+        description: "分支"
+        required: true
+        default: 'sm8750'
+      FEIL:
+        description: "配置文件"
+        required: true
+        default: 'oneplus_ace5_pro'
+      CPUD:
+        description: "处理器代号"
+        required: true
+        default: 'sun'
+      ANDROID_VERSION:
+        description: "内核安卓版本"
+        required: true
+        default: 'android15'
+      KERNEL_VERSION:
+        description: "内核版本"
+        required: true
+        default: '6.6'
+      KERNEL_NAME:
+        description: "修改内核名称"
+        required: true
+        default: '-android15-521'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "GitHub Actions"  # 移除硬编码邮箱
+          git config --global user.email "actions@github.com"
+
+      - name: Install dependencies
+        run: |
+          sudo apt update && sudo apt upgrade -y
+          # 添加交叉编译工具链
+          sudo apt install -y python3 git curl gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Install repo tool
+        run: |
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          chmod a+x ~/repo
+          sudo mv ~/repo /usr/local/bin/repo
+
+      - name: Initialize repo and sync
+        run: |
+          mkdir kernel_workspace && cd kernel_workspace
+          repo init -u https://github.com/t521418/kernel_manifest.git -b refs/heads/oneplus/${{ github.event.inputs.CPU }} -m ${{ github.event.inputs.FEIL }}.xml --depth=1
+          repo --trace sync -c -j$(nproc --all) --no-tags
+          rm -f kernel_platform/common/android/abi_gki_protected_exports_*  # 使用 -f 避免错误
+          rm -f kernel_platform/msm-kernel/android/abi_gki_protected_exports_*
+
+      - name: Set up SukiSU
+        working-directory: kernel_workspace/kernel_platform  # 固定工作目录
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-dev
+          cd ./KernelSU
+          KSU_VERSION=$(expr $(git rev-list --count main) "+" 10606)
+          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV  # 确保环境变量传递
+          sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
+
+      - name: Set up susfs
+        working-directory: kernel_workspace/kernel_platform
+        run: |
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }} ../susfs4ksu
+          git clone https://github.com/ExmikoN/SukiSU_patch.git ../SukiSU_patch
+          # 复制文件并应用补丁（严格检查错误）
+          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ inputs.ANDROID_VERSION }}-${{ inputs.KERNEL_VERSION }}.patch ./common/
+          cp ../susfs4ksu/kernel_patches/fs/* ./common/fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
+          cp -r ../SukiSU_patch/other/lz4k/include/linux/* ./common/include/linux
+          cp -r ../SukiSU_patch/other/lz4k/lib/* ./common/lib
+          cp -r ../SukiSU_patch/other/lz4k/crypto/* ./common/crypto
+          cd ./common
+          sed -i 's/-32,12 +32,38/-32,11 +32,37/g' 50_add_susfs_in_gki-*.patch
+          sed -i '/#include <trace\/hooks\/fs.h>/d' 50_add_susfs_in_gki-*.patch
+          patch -p1 < 50_add_susfs_in_gki-*.patch  # 移除 || true
+          cp ../../SukiSU_patch/hooks/syscall_hooks.patch ./
+          patch -p1 -F 3 < syscall_hooks.patch
+
+      - name: Apply lz4kd Patches
+        working-directory: kernel_workspace/kernel_platform/common
+        run: |
+          cp ../../SukiSU_patch/other/lz4k_patch/${{ github.event.inputs.KERNEL_VERSION }}/lz4kd.patch ./
+          patch -p1 -F 3 < lz4kd.patch  # 严格检查补丁
+
+      - name: Add SUSFS Configuration Settings
+        working-directory: kernel_workspace/kernel_platform
+        run: |
+          echo "CONFIG_KSU=y" >> ./common/arch/arm64/configs/gki_defconfig
+          # ...（保持原有配置项）
+          sed -i 's/check_defconfig//' ./common/build.config.gki
+          cd common
+          git add -A && git commit -a -m "BUILD Kernel"
+
+      - name: Add make name
+        working-directory: kernel_workspace/kernel_platform
+        run: |
+          sed -i 's/res="\$res\$(cat "\$file")"/res="${{ github.event.inputs.KERNEL_NAME }}"/g' ./common/scripts/setlocalversion
+
+      - name: Add sched_ext
+        working-directory: kernel_workspace/kernel_platform
+        run: |
+          git clone https://github.com/t521418/android_kernel_common_oneplus_sm8750.git
+          cp -r ./android_kernel_common_oneplus_sm8750/kernel/sched/* ./common/kernel/sched
+          rm -rf ./android_kernel_common_oneplus_sm8750/kernel/sched/.git
+          cd common/kernel/sched
+          sed -i.bak '/# include "ext.c"/a\# include "hmbird_sched_proc_main.c"\n#endif\n\n#ifdef CONFIG_SLIM_SCHED\n# include "slim_sysctl.c"' build_policy.c
+
+      - name: Build kernel
+        working-directory: kernel_workspace/kernel_platform
+        run: |
+          # 添加详细日志参数
+          tools/bazel run --config=fast --config=stamp --lto=thin --verbose_failures --sandbox_debug //common:kernel_aarch64_dist -- --dist_dir=dist
+
+      - name: Patch Kernel Image
+        working-directory: kernel_workspace/kernel_platform/dist
+        run: |
+          curl -LO https://github.com/ShirkNeko/SukiSU_KernelPatch_patch/releases/download/0.11-beta/patch_linux
+          chmod +x patch_linux
+          ./patch_linux
+          rm -f Image && mv oImage Image
+
+      - name: Prepare AnyKernel3  # 重命名避免重复
+        working-directory: kernel_workspace/kernel_platform/dist
+        run: |
+          git clone https://github.com/t521418/AnyKernel3.git --depth=1
+          rm -rf AnyKernel3/.git AnyKernel3/push.sh
+          cp Image AnyKernel3/
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SuKiSu_${{ env.KSUVER }}_${{ github.event.inputs.FEIL }}
+          path: |
+            kernel_workspace/kernel_platform/dist/AnyKernel3/*
+            kernel_workspace/kernel_platform/dist/Image
